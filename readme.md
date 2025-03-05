@@ -22,6 +22,6 @@ To run the service
 ./bin/server <PORT>
 ```
 
-NB: <PORT> must be an available port , if not provided the program fallsback to 3000
+NB: `<PORT>` must be an available port , if not provided the program fallsback to 3000
 
-After that if you visit http://localhost:<PORT> with your browser you should receive a Hey message :)
+After that if you visit `http://localhost:<PORT>` with your browser you should receive a Hey message :)
