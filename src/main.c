@@ -698,11 +698,13 @@ int main(int argc, char **argv) {
             if (resolved == NULL) {
                 // Failed to resolve path
                 response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
+                response.body_length = strlen(response.body);
                 response.status = 404;
             } else {
                 // Check if path traversal is occurred
                 if (!start_with(resolved, public_path)) {
                     response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
+                    response.body_length = strlen(response.body);
                     response.status = 404;
                 } else {
                     char *extension = get_extension(resolved);
