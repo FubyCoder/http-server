@@ -14,7 +14,7 @@ cmake .
 
 Run make to compile the program
 ```bash
-make .
+make
 ```
 
 To run the service
@@ -25,3 +25,7 @@ To run the service
 NB: `<PORT>` must be an available port , if not provided the program fallsback to 3000
 
 After that if you visit `http://localhost:<PORT>` with your browser you should receive a Hey message :)
+
+
+## Usage in production
+No just no, use something that is more secure and already battle-tested

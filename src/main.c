@@ -8,195 +8,38 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-const char *base_html_page = "<!DOCTYPE html><html><body><h1>HEY</h1></body></html>\0";
+#include "fs.h"
+#include "http/content-type.h"
+#include "http/headers.h"
+#include "http/parser_helpers.h"
+#include "http/status.h"
+#include "str.h"
 
-typedef struct HTTP_VERSION {
+#define DEBUG
+
+typedef struct HttpVersion {
     long major;
     long minor;
 } http_version_t;
 
-typedef struct Header {
-    char *name;
-    char *value;
-} header_t;
-
-typedef struct HeaderList {
-    size_t capacity;
-    size_t length;
-    header_t **data;
-} header_list_t;
-
-header_list_t *create_header_list(size_t initial_capacity) {
-    header_list_t *list = malloc(sizeof(header_list_t));
-
-    if (list == NULL) {
-        return NULL;
-    }
-
-    header_t **data = calloc(initial_capacity, sizeof(header_t *));
-    if (data == NULL) {
-        free(list);
-        return NULL;
-    }
-
-    list->data = data;
-    list->capacity = initial_capacity;
-    list->length = 0;
-
-    return list;
-}
-
-/**
-Returns
-- -1 if append fails
-- 0 if succeed
-*/
-int append_header_list(header_list_t *header_list, header_t *item) {
-    if (header_list->length == header_list->capacity) {
-        int new_capacity = header_list->capacity + 2;
-        header_t **new_data = realloc(header_list->data, sizeof(header_t) * (new_capacity));
-
-        if (new_data == NULL) {
-            return -1;
-        }
-
-        header_list->data = new_data;
-        header_list->capacity = new_capacity;
-    }
-
-    header_list->data[header_list->length++] = item;
-    return 0;
-}
-
-void free_header(header_t *header) {
-    if (header->name != NULL) {
-        free(header->name);
-    }
-
-    if (header->value != NULL) {
-        free(header->value);
-    }
-
-    if (header != NULL) {
-        free(header);
-    }
-}
-
-void print_header(header_t *header) {
-    printf("header : %s : %s\n", header->name, header->value);
-}
-
-void print_header_list(header_list_t *list) {
-    for (size_t i = 0; i < list->length; i++) {
-        print_header(list->data[i]);
-    }
-}
-
-void free_header_list(header_list_t *header_list) {
-    if (header_list == NULL) {
-        return;
-    }
-
-    for (size_t i = 0; i < header_list->length; i++) {
-        free_header(header_list->data[i]);
-    }
-
-    free(header_list->data);
-    free(header_list);
-}
-
 typedef struct Request {
     char *method;
     char *uri;
-    char *version;
-
+    http_version_t *version;
     header_list_t *headers;
-
-    struct Query {
-        char *name;
-        char *value;
-    } *query;
-
     char *body;
 } request_t;
 
-/**
-Returns 1 when true
-for alpha is any character between A-Z and a-z
-*/
-int is_alpha(char c) {
-    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
-        return 1;
-    }
-
-    return 0;
-}
-
-int is_numeric(char c) {
-    if (c >= '0' && c <= '9') {
-        return 1;
-    }
-
-    return 0;
-}
-
-int is_ctl(char c) {
-    // Values between 0 - 31 in base 8 (octal) and value number 127 (0177 in base
-    // 8) specified in HTTP/1.0 spec sec 2.2
-    if ((c >= 00 && c <= 031) || c == 0177) {
-        return 1;
-    }
-
-    return 0;
-}
-
-// tspecials from HTTP/1.0 spec
-int is_tspecial(char c) {
-    switch (c) {
-    case ('('):
-    case (')'):
-    case ('<'):
-    case ('>'):
-    case ('@'):
-    case (','):
-    case (';'):
-    case (':'):
-    case ('\\'):
-    case ('"'):
-    case ('/'):
-    case ('['):
-    case (']'):
-    case ('?'):
-    case ('='):
-    case ('{'):
-    case ('}'):
-    case (' '):
-    case (0x9):
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-int is_token(char c) {
-    if (!is_ctl(c) && !is_tspecial(c)) {
-        return 1;
-    }
-
-    return 0;
-}
-
-int is_hex(char c) {
-    if (is_numeric(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-        return 1;
-    }
-
-    return 0;
-}
+typedef struct Response {
+    int status;
+    header_list_t *headers;
+    char *body;
+    size_t body_length;
+} response_t;
 
 // IF the character is matched we consume it by incementing i
 // TODO: use buffer_size and avoid overflow
-int expect_char(char **buffer, int *i, char expected) {
+int expect_char(char **buffer, size_t *i, char expected) {
     if ((*buffer)[*i] == expected) {
         *i = *i + 1;
         return 0;
@@ -205,9 +48,9 @@ int expect_char(char **buffer, int *i, char expected) {
     return -1;
 }
 
-char *extract_token(char **buffer, int buffer_size, int *index) {
-    int i = *index;
-    int l = i;
+char *extract_token(char **buffer, size_t buffer_size, size_t *index) {
+    size_t i = *index;
+    size_t l = i;
     char *buf = *buffer;
 
     while (is_token(buf[l])) {
@@ -235,9 +78,9 @@ char *extract_token(char **buffer, int buffer_size, int *index) {
     return extracted;
 }
 
-char *extract_method(char **buffer, int buffer_size, int *index) {
-    int i = *index;
-    int l = i;
+char *extract_method(char **buffer, size_t buffer_size, size_t *index) {
+    size_t i = *index;
+    size_t l = i;
     char *buf = *buffer;
 
     while (is_alpha(buf[l])) {
@@ -267,33 +110,28 @@ char *extract_method(char **buffer, int buffer_size, int *index) {
     return method_extract;
 }
 
-char *extract_uri(char **buffer, int buffer_size, int *index) {
-    int i = *index;
-    int l = i;
+char *extract_uri(char **buffer, size_t buffer_size, size_t *index) {
+    size_t i = *index;
+    size_t l = i;
     char *buf = *buffer;
 
     // TODO implement other spec of http with hex string and some special chars
-    while (is_alpha(buf[l]) || buf[l] == '/' || buf[l] == '.' || is_numeric(buf[l])) {
-        if (l >= buffer_size) {
-            printf("L OUT OF BUFFER_SIZE\n");
-            return NULL;
-        }
+    while (l + 1 < buffer_size &&
 
+           (is_alpha(buf[l]) || buf[l] == '/' || buf[l] == '.' || buf[l] == '_' || buf[l] == '-' || is_numeric(buf[l]))
+
+    ) {
         l++;
     }
 
     const int size = l - i;
     if (size <= 0) {
-        printf("SIZE is NEGATIVE : %i\n", size);
-        printf("I: %i, L: %i\n", i, l);
         return NULL;
     }
 
     char *extracted = malloc(size + 1);
 
     if (extracted == NULL) {
-        printf("MALLOC FAIL\n");
-        // FAILED TO ALLOCATE MEMORY
         return NULL;
     }
 
@@ -305,15 +143,12 @@ char *extract_uri(char **buffer, int buffer_size, int *index) {
 }
 
 // TODO: use buffer_size and avoid overflow
-long extract_int(char **buffer, int buffer_size, int *index) {
-    int i = *index;
-    int l = i;
+long extract_int(char **buffer, size_t buffer_size, size_t *index) {
+    size_t i = *index;
+    size_t l = i;
     char *buf = *buffer;
 
-    while (isdigit(buf[l])) {
-        if (l > buffer_size) {
-            return -1;
-        }
+    while (l < buffer_size && isdigit(buf[l])) {
         l++;
     }
 
@@ -339,15 +174,12 @@ long extract_int(char **buffer, int buffer_size, int *index) {
 }
 
 // TODO implement LWS checks as HTTP/1.0 spec
-char *extract_text(char **buffer, int buffer_size, int *index) {
-    int i = *index;
-    int l = i;
+char *extract_text(char **buffer, size_t buffer_size, size_t *index) {
+    size_t i = *index;
+    size_t l = i;
     char *buf = *buffer;
 
-    while (!is_ctl(buf[l])) {
-        if (l > buffer_size) {
-            return NULL;
-        }
+    while (l < buffer_size && !is_ctl(buf[l])) {
         l++;
     }
 
@@ -368,7 +200,7 @@ char *extract_text(char **buffer, int buffer_size, int *index) {
     return extracted;
 }
 
-header_t *extract_header(char **buffer, int buffer_size, int *index) {
+header_t *extract_header(char **buffer, size_t buffer_size, size_t *index) {
     char *name = extract_token(buffer, buffer_size, index);
     if (name == NULL) {
         return NULL;
@@ -427,7 +259,7 @@ header_t *extract_header(char **buffer, int buffer_size, int *index) {
  * so 1.1 > 1.01 and 1.12 > 1.1
  * and 2.1 > 1.11
  */
-http_version_t *extract_http_version(char **buffer, int buffer_size, int *index) {
+http_version_t *extract_http_version(char **buffer, size_t buffer_size, size_t *index) {
     if (expect_char(buffer, index, 'H') != 0) {
         return NULL;
     }
@@ -474,12 +306,12 @@ http_version_t *extract_http_version(char **buffer, int buffer_size, int *index)
     return version;
 }
 
-void parse_request(int client_fd) {
+request_t *parse_request(int client_fd) {
     const int CHUNK_SIZE = 512;
     char *buffer = calloc(CHUNK_SIZE, 1);
 
     if (buffer == NULL) {
-        return;
+        return NULL;
     }
 
     size_t buffer_size = 0;
@@ -493,13 +325,13 @@ void parse_request(int client_fd) {
 
         if (read_result == -1) {
             // TODO handle error
-            return;
+            return NULL;
         }
 
         if (buffer_size + read_result >= buffer_capacity) {
             char *new_buffer = realloc(buffer, buffer_capacity + CHUNK_SIZE);
             if (new_buffer == NULL) {
-                return;
+                return NULL;
             }
             buffer = new_buffer;
             buffer_capacity = buffer_capacity + CHUNK_SIZE;
@@ -514,7 +346,7 @@ void parse_request(int client_fd) {
 
                 char *new_buffer = realloc(buffer, buffer_capacity + 1);
                 if (new_buffer == NULL) {
-                    return;
+                    return NULL;
                 }
 
                 buffer = new_buffer;
@@ -539,14 +371,13 @@ void parse_request(int client_fd) {
     // However we should also check that the data is there
     long content_length = 0;
 
-    int line = 0;
-
-    int i = 0;
+    size_t i = 0;
 
     method = extract_method(&buffer, buffer_size, &i);
     if (method == NULL) {
         free(buffer);
-        return;
+        // FAILED TO EXTRACT METHOD
+        return NULL;
     }
 
     simple_request_candidate = strcmp(method, "GET");
@@ -555,14 +386,14 @@ void parse_request(int client_fd) {
     if (expect_char(&buffer, &i, ' ') == -1) {
         free(buffer);
         free(method);
-        return;
+        return NULL;
     }
 
     uri = extract_uri(&buffer, buffer_size, &i);
     if (uri == NULL) {
         free(buffer);
         free(method);
-        return;
+        return NULL;
     }
 
     // AS for HTML 1 spec we have a space after a URI
@@ -570,7 +401,7 @@ void parse_request(int client_fd) {
         free(buffer);
         free(method);
         free(uri);
-        return;
+        return NULL;
     }
 
     version = extract_http_version(&buffer, buffer_size, &i);
@@ -583,7 +414,7 @@ void parse_request(int client_fd) {
                 free(buffer);
                 free(method);
                 free(uri);
-                return;
+                return NULL;
             }
 
             version->major = 0;
@@ -593,7 +424,7 @@ void parse_request(int client_fd) {
             free(buffer);
             free(method);
             free(uri);
-            return;
+            return NULL;
         }
     } else {
         simple_request_candidate = 1;
@@ -603,7 +434,7 @@ void parse_request(int client_fd) {
         free(buffer);
         free(method);
         free(uri);
-        return;
+        return NULL;
     }
 
     if (expect_char(&buffer, &i, '\n') == -1) {
@@ -611,7 +442,7 @@ void parse_request(int client_fd) {
         free(method);
         free(uri);
 
-        return;
+        return NULL;
     }
 
     // No longer in HTTP/0.9 land
@@ -622,7 +453,7 @@ void parse_request(int client_fd) {
             free(buffer);
             free(method);
             free(uri);
-            return;
+            return NULL;
         }
 
         // Why this strange check ?
@@ -639,13 +470,13 @@ void parse_request(int client_fd) {
                 free(method);
                 free(uri);
                 free_header_list(header_list);
-                return;
+                // Failed to extract an header
+                return NULL;
             }
 
             // TODO header names are case insensitive as HTTP/1.0 spec
             // We should lowercase them before comparing
-            printf("headerName : '%s'\n", header->name);
-            if (strcmp("Content-Length\0", header->name) == 0) {
+            if (strcmp("Content-Length", header->name) == 0) {
                 content_length = strtol(header->value, NULL, 10);
             }
 
@@ -666,7 +497,7 @@ void parse_request(int client_fd) {
             free(version);
             free(buffer);
             free_header_list(header_list);
-            return;
+            return NULL;
         }
 
         if (i + content_length > buffer_size) {
@@ -677,33 +508,81 @@ void parse_request(int client_fd) {
             free(version);
             free(buffer);
             free_header_list(header_list);
-            return;
+            return NULL;
         }
 
         memcpy(body, buffer + i, content_length);
         body[content_length] = '\0';
     }
 
-    printf("METHOD: %s\n", method);
-    printf("URI: %s\n", uri);
-    printf("VERSION: %li.%li\n", version->major, version->minor);
-    printf("Candidate simple: %i\n", simple_request_candidate);
-    printf("Content-Length: %li\n", content_length);
-
-    if (header_list != NULL) {
-        print_header_list(header_list);
+    request_t *request = malloc(sizeof(request_t));
+    if (request == NULL) {
+        free(method);
+        free(uri);
+        free(version);
+        free(buffer);
+        free(body);
+        free_header_list(header_list);
+        return NULL;
     }
 
-    if (body != NULL) {
-        printf("BODY: %s\n", body);
-    }
-
-    // TODO remove this when the function returns a request_t struct
-    free(method);
-    free(uri);
-    free(version);
     free(buffer);
-    free_header_list(header_list);
+
+    request->method = method;
+    request->uri = uri;
+    request->version = version;
+    request->body = body;
+    request->headers = header_list;
+
+    return request;
+}
+
+string_t *create_response(request_t *request, response_t *response) {
+    string_t *res = create_string(10);
+
+    char *status_code = int_to_str(response->status);
+    char *status_message = get_status_string(response->status);
+
+    if (status_code == NULL) {
+        // TODO make free_string_t function
+        free(res->data);
+        free(res);
+        return NULL;
+    }
+
+    char *body_length = int_to_str(strlen(response->body));
+
+    if (body_length == NULL) {
+        // TODO make free_string_t function
+        free(res->data);
+        free(res);
+        free(status_code);
+        return NULL;
+    }
+
+    append_string(res, "HTTP/1.0");
+    append_string(res, " ");
+    append_string(res, status_code);
+    append_string(res, " ");
+    append_string(res, status_message);
+    append_string(res, "\r\n");
+
+    if (response->headers && response->headers->length > 0) {
+        for (size_t i = 0; i < response->headers->length; i++) {
+            char *header_str = format_header_string(response->headers->data[i]);
+            append_string(res, header_str);
+            free(header_str);
+        }
+    }
+
+    append_string(res, "\r\n");
+
+    append_rawchars(res, response->body, response->body_length);
+
+    free(body_length);
+    free(status_code);
+
+    return res;
 }
 
 int main(int argc, char **argv) {
@@ -746,6 +625,20 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        printf("Current working dir: %s\n", cwd);
+    }
+
+    // TODO this should be more dynamic with a router struct
+    // the struct should allow us to bind multiple directories
+    // At the moment we only have one
+    char public_path[PATH_MAX] = "\0";
+    strcat(public_path, cwd);
+    strcat(public_path, "/public");
+
+    // TODO implement a way to close all fd even when doing SIGINT
+    // TODO fork the process to handle multiple request at the same time
     while (1) {
         struct sockaddr_in client_address;
         socklen_t client_len;
@@ -757,19 +650,94 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        parse_request(client_fd);
+        request_t *request = parse_request(client_fd);
+        if (request == NULL) {
+            // TODO implement request reply for errors
+            // We are either in 2 cases
+            // - The request has failed to parse for some reason (like malformed)
+            // - The request has failed to parse for memory issues (failed to malloc / realloc)
+            // We should reply with a 500 or close the socket directly based on the situation
+            // 500 -> An error by our end
+            // socket close -> Malformed request
+            continue;
+        }
 
-        // SIMPLE REQUEST = GET <uri> <CRLF>
+#ifdef DEBUG
+        printf("[%s] %s\n", request->method, request->uri);
+#endif
 
-        // "HTTP/1.0 200 OK\n"
-        //                  "\r\n"
-        //
-        char *response = "HTTP/1.0 200 OK\r\n"
-                         "Content-Type: text/html\r\n"
-                         "Content-Lenght: 40\r\n\r\n"
-                         "<html><body><h1>HEY</h1></body></html>\0";
+        header_list_t *header_list = create_header_list(3);
+        response_t response = {
+            .status = 200,
+            .headers = header_list,
+            .body = "<!DOCTYPE html><html><body><h1>NON ROOT :(</h1></body></html>",
+        };
 
-        send(client_fd, response, strlen(response), 0);
+        // if (strcmp(request->method, "GET") == 0 && strcmp(request->uri, "/") == 0) {
+        //     response.body = "<!DOCTYPE html><html><body><h1>ROOT :)</h1></body></html>";
+        // } else
+        if (strcmp(request->method, "GET") == 0) {
+            // TODO make this section separate to handle filesystem
+
+            char file_path[PATH_MAX] = "\0";
+            strcat(file_path, public_path);
+            // TODO verify uri
+            strcat(file_path, request->uri);
+
+            long uri_len = strlen(request->uri);
+            if (request->uri[uri_len - 1] == '/') {
+                // IF ends with slash append index.html
+                strcat(file_path, "index.html");
+            }
+
+            // Full path should be used only if resolved is equal to NULL
+            // TODO usaged of full_path
+            char *full_path = NULL;
+            char *resolved = realpath(file_path, full_path);
+
+            if (resolved == NULL) {
+                // Failed to resolve path
+                response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
+                response.status = 404;
+            } else {
+                // Check if path traversal is occurred
+                if (!start_with(resolved, public_path)) {
+                    response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
+                    response.status = 404;
+                } else {
+                    char *extension = get_extension(resolved);
+
+                    // TODO handle NULL for content_type
+                    header_t *content_type = get_content_type_header(extension);
+                    append_header_list(response.headers, content_type);
+
+                    FILE *file = fopen(resolved, "rb");
+                    file_info_t *file_response = read_file(file);
+                    fclose(file);
+
+                    response.body = file_response->data;
+                    response.body_length = file_response->size;
+
+                    char *buff_size_len = int_to_str(file_response->size);
+                    header_t *content_length = create_header("Content-Length", buff_size_len);
+                    append_header_list(response.headers, content_length);
+
+                    free(full_path);
+                    free(file_response);
+                }
+            }
+        }
+
+        string_t *res = create_response(NULL, &response);
+
+        send(client_fd, res->data, res->length, 0);
+
+        // TODO replace this with free_string_t when made
+        free(res->data);
+        free(res);
+
+        // TODO add free response.body when all bodies are heap allocated
+        // TODO add free response.headers when all headers are heap allocated
 
         if (shutdown(client_fd, SHUT_RDWR) == -1) {
             printf("Failed to close client connection\n");
@@ -778,5 +746,6 @@ int main(int argc, char **argv) {
 
         close(client_fd);
     }
+
     return 0;
 }
