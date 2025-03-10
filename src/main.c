@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <linux/limits.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,9 +14,10 @@
 #include "http/headers.h"
 #include "http/parser_helpers.h"
 #include "http/status.h"
+#include "http_thread.h"
 #include "str.h"
 
-#define DEBUG
+const int MAX_THREAD_COUNT = 8;
 
 typedef struct HttpVersion {
     long major;
@@ -157,18 +159,13 @@ long extract_int(char **buffer, size_t buffer_size, size_t *index) {
         return -1;
     }
 
-    char *extracted = malloc(size + 1);
-    if (extracted == NULL) {
-        return -1;
-    }
+    char text[size + 1];
 
-    memcpy(extracted, buf + i, size);
-    extracted[size] = '\0';
+    memcpy(text, buf + i, size);
+    text[size] = '\0';
 
-    long number = strtol(extracted, NULL, 10);
+    long number = strtol(text, NULL, 10);
     *index = l;
-
-    free(extracted);
 
     return number;
 }
@@ -405,6 +402,7 @@ request_t *parse_request(int client_fd) {
     }
 
     version = extract_http_version(&buffer, buffer_size, &i);
+
     if (version == NULL) {
         if (simple_request_candidate == 0) {
             // IF NO VERSION we are receiving an HTTP/0.9 request so we can also
@@ -447,8 +445,8 @@ request_t *parse_request(int client_fd) {
 
     // No longer in HTTP/0.9 land
     if (simple_request_candidate != 0) {
-
         header_list = create_header_list(5);
+
         if (header_list == NULL) {
             free(buffer);
             free(method);
@@ -585,7 +583,106 @@ string_t *create_response(request_t *request, response_t *response) {
     return res;
 }
 
+void handle_http_request(int client_fd, char *public_path) {
+    request_t *request = parse_request(client_fd);
+    if (request == NULL) {
+        // TODO implement request reply for errors
+        // We are either in 2 cases
+        // - The request has failed to parse for some reason (like malformed)
+        // - The request has failed to parse for memory issues (failed to malloc / realloc)
+        // We should reply with a 500 or close the socket directly based on the situation
+        // 500 -> An error by our end
+        // socket close -> Malformed request
+        return;
+    }
+
+    printf("[%s] %s\n", request->method, request->uri);
+
+    header_list_t *header_list = create_header_list(3);
+    response_t response = {
+        .status = 200,
+        .headers = header_list,
+        .body = "<!DOCTYPE html><html><body><h1>NON ROOT :(</h1></body></html>",
+    };
+
+    if (strcmp(request->method, "GET") == 0) {
+        // TODO make this section separate to handle filesystem
+
+        char file_path[PATH_MAX] = "\0";
+        strcat(file_path, public_path);
+        // TODO verify uri length
+        strcat(file_path, request->uri);
+
+        long uri_len = strlen(request->uri);
+        if (request->uri[uri_len - 1] == '/') {
+            // IF ends with slash append index.html
+            strcat(file_path, "index.html");
+        }
+
+        // Full path should be used only if resolved is equal to NULL
+        // TODO usaged of full_path
+        char *full_path = NULL;
+        char *resolved = realpath(file_path, full_path);
+
+        if (resolved == NULL) {
+            // Failed to resolve path
+            response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
+            response.body_length = strlen(response.body);
+            response.status = 404;
+        } else {
+            // Check if path traversal is occurred
+            if (!start_with(resolved, public_path)) {
+                response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
+                response.body_length = strlen(response.body);
+                response.status = 404;
+            } else {
+                char *extension = get_extension(resolved);
+
+                // TODO handle NULL for content_type
+                header_t *content_type = get_content_type_header(extension);
+                append_header_list(response.headers, content_type);
+
+                FILE *file = fopen(resolved, "rb");
+                file_info_t *file_response = read_file(file);
+                fclose(file);
+
+                response.body = file_response->data;
+                response.body_length = file_response->size;
+
+                char *buff_size_len = int_to_str(file_response->size);
+                header_t *content_length = create_header("Content-Length", buff_size_len);
+                append_header_list(response.headers, content_length);
+
+                free(full_path);
+                free(file_response);
+            }
+        }
+    }
+
+    string_t *res = create_response(NULL, &response);
+
+    send(client_fd, res->data, res->length, 0);
+
+    // TODO replace this with free_string_t when made
+    free(res->data);
+    free(res);
+
+    // TODO add free response.body when all bodies are heap allocated
+    // TODO add free response.headers when all headers are heap allocated
+
+    if (shutdown(client_fd, SHUT_RDWR) == -1) {
+        printf("Failed to close client connection\n");
+        return;
+    }
+
+    close(client_fd);
+}
+
 int main(int argc, char **argv) {
+    http_task_t *tasks = malloc(sizeof(http_task_t) * 100);
+    size_t tasks_count = 0;
+
+    pthread_t threads[MAX_THREAD_COUNT];
     struct sockaddr_in address;
     int fd;
 
@@ -593,36 +690,6 @@ int main(int argc, char **argv) {
 
     if (argc > 1) {
         port = atoi(argv[1]);
-    }
-
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-
-    if (fd == -1) {
-        printf("Failed to open a socket\n");
-        return -1;
-    }
-
-    address.sin_port = htons(port);
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_family = AF_INET;
-
-    if (bind(fd, (struct sockaddr_in *)&address, sizeof(struct sockaddr_in)) == -1) {
-
-        if (errno == EADDRINUSE) {
-            printf("Port %i already in use\n", port);
-            return -1;
-        } else {
-            printf("Failed to bind socket\n");
-        }
-
-        return -1;
-    }
-
-    printf("Socket ready at port %i\n", port);
-
-    if (listen(fd, 10) == -1) {
-        printf("Error \n");
-        return -1;
     }
 
     char cwd[PATH_MAX];
@@ -637,8 +704,46 @@ int main(int argc, char **argv) {
     strcat(public_path, cwd);
     strcat(public_path, "/public");
 
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (fd == -1) {
+        printf("Failed to open a socket\n");
+        return EXIT_FAILURE;
+    }
+
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_family = AF_INET;
+
+    if (bind(fd, (struct sockaddr_in *)&address, sizeof(struct sockaddr_in)) == -1) {
+
+        if (errno == EADDRINUSE) {
+            printf("Port %i already in use\n", port);
+            return EXIT_FAILURE;
+        } else {
+            printf("Failed to bind socket\n");
+        }
+
+        return EXIT_FAILURE;
+    }
+
+    if (listen(fd, 10) == -1) {
+        return EXIT_FAILURE;
+    }
+
+    printf("Socket ready at port %i\n", port);
+
+    // INITIALIZE THREADS FOR THREAD POOL
+
+    setup_http_tasks();
+    for (int i = 0; i < MAX_THREAD_COUNT; i++) {
+        if (pthread_create(&threads[i], NULL, (void *)start_http_task,
+                           &(http_thread_args_t){.tasks_queue_count = &tasks_count, .tasks_queue = &tasks})) {
+            return EXIT_FAILURE;
+        }
+    }
+
     // TODO implement a way to close all fd even when doing SIGINT
-    // TODO fork the process to handle multiple request at the same time
     while (1) {
         struct sockaddr_in client_address;
         socklen_t client_len;
@@ -650,104 +755,19 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        request_t *request = parse_request(client_fd);
-        if (request == NULL) {
-            // TODO implement request reply for errors
-            // We are either in 2 cases
-            // - The request has failed to parse for some reason (like malformed)
-            // - The request has failed to parse for memory issues (failed to malloc / realloc)
-            // We should reply with a 500 or close the socket directly based on the situation
-            // 500 -> An error by our end
-            // socket close -> Malformed request
-            continue;
-        }
+        http_task_t task = {.handle = &handle_http_request, .arg1 = client_fd, .arg2 = public_path};
 
-#ifdef DEBUG
-        printf("[%s] %s\n", request->method, request->uri);
-#endif
-
-        header_list_t *header_list = create_header_list(3);
-        response_t response = {
-            .status = 200,
-            .headers = header_list,
-            .body = "<!DOCTYPE html><html><body><h1>NON ROOT :(</h1></body></html>",
-        };
-
-        // if (strcmp(request->method, "GET") == 0 && strcmp(request->uri, "/") == 0) {
-        //     response.body = "<!DOCTYPE html><html><body><h1>ROOT :)</h1></body></html>";
-        // } else
-        if (strcmp(request->method, "GET") == 0) {
-            // TODO make this section separate to handle filesystem
-
-            char file_path[PATH_MAX] = "\0";
-            strcat(file_path, public_path);
-            // TODO verify uri
-            strcat(file_path, request->uri);
-
-            long uri_len = strlen(request->uri);
-            if (request->uri[uri_len - 1] == '/') {
-                // IF ends with slash append index.html
-                strcat(file_path, "index.html");
-            }
-
-            // Full path should be used only if resolved is equal to NULL
-            // TODO usaged of full_path
-            char *full_path = NULL;
-            char *resolved = realpath(file_path, full_path);
-
-            if (resolved == NULL) {
-                // Failed to resolve path
-                response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
-                response.body_length = strlen(response.body);
-                response.status = 404;
-            } else {
-                // Check if path traversal is occurred
-                if (!start_with(resolved, public_path)) {
-                    response.body = "<!DOCTYPE html><html><body><h1>File not found :(</h1></body></html>";
-                    response.body_length = strlen(response.body);
-                    response.status = 404;
-                } else {
-                    char *extension = get_extension(resolved);
-
-                    // TODO handle NULL for content_type
-                    header_t *content_type = get_content_type_header(extension);
-                    append_header_list(response.headers, content_type);
-
-                    FILE *file = fopen(resolved, "rb");
-                    file_info_t *file_response = read_file(file);
-                    fclose(file);
-
-                    response.body = file_response->data;
-                    response.body_length = file_response->size;
-
-                    char *buff_size_len = int_to_str(file_response->size);
-                    header_t *content_length = create_header("Content-Length", buff_size_len);
-                    append_header_list(response.headers, content_length);
-
-                    free(full_path);
-                    free(file_response);
-                }
-            }
-        }
-
-        string_t *res = create_response(NULL, &response);
-
-        send(client_fd, res->data, res->length, 0);
-
-        // TODO replace this with free_string_t when made
-        free(res->data);
-        free(res);
-
-        // TODO add free response.body when all bodies are heap allocated
-        // TODO add free response.headers when all headers are heap allocated
-
-        if (shutdown(client_fd, SHUT_RDWR) == -1) {
-            printf("Failed to close client connection\n");
-            continue;
-        }
-
-        close(client_fd);
+        // TODO we should check if tasks has enought space to store in queue
+        enqueue_http_task(&tasks, &tasks_count, task);
     }
 
+    for (int i = 0; i < MAX_THREAD_COUNT; i++) {
+        if (pthread_join(threads[i], NULL)) {
+            printf("Failed to join threads\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    destroy_http_tasks();
     return 0;
 }

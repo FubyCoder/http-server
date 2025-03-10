@@ -32,8 +32,8 @@ file_info_t *read_file(FILE *file) {
             char *new_file_buffer = realloc(file_buffer, new_capacity);
 
             if (new_file_buffer == NULL) {
-                // TODO handle error
-                exit(1);
+                free(file_buffer);
+                return NULL;
             }
 
             file_buffer = new_file_buffer;
