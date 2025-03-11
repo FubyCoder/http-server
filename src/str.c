@@ -41,7 +41,7 @@ int append_rawchars(string_t *string, char *text, size_t text_length) {
         string->capacity = new_capacity;
     }
 
-    memmove(string->data + string->length, text, text_length);
+    memcpy(string->data + string->length, text, text_length);
     string->length += text_length;
 
     return 0;

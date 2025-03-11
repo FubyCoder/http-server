@@ -1,5 +1,6 @@
-#include "status.h"
 #include <stddef.h>
+
+#include "status.h"
 
 static const status_map_t status_map[] = {
     // Informational Responses (100–199)

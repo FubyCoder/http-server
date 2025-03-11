@@ -1,10 +1,4 @@
-#include <linux/limits.h>
-#include <netinet/in.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "fs.h"
 
@@ -32,7 +26,6 @@ file_info_t *read_file(FILE *file) {
     while ((read_size = fread(buffer + size, 1, CHUNK_SIZE, file)) != 0) {
         if (size + CHUNK_SIZE >= capacity) {
             new_capacity = capacity * 2;
-            printf("1. size %li\n", new_capacity);
             tmp_buffer = realloc(buffer, new_capacity);
 
             if (tmp_buffer == NULL) {
