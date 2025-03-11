@@ -3,6 +3,7 @@
 #include <linux/limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -305,56 +306,42 @@ http_version_t *extract_http_version(char **buffer, size_t buffer_size, size_t *
 
 request_t *parse_request(int client_fd) {
     const int CHUNK_SIZE = 512;
+    size_t buffer_size = 0;
+    size_t buffer_capacity = CHUNK_SIZE;
     char *buffer = calloc(CHUNK_SIZE, 1);
 
     if (buffer == NULL) {
         return NULL;
     }
 
-    size_t buffer_size = 0;
-    size_t buffer_capacity = CHUNK_SIZE;
+    long read_result = -2;
 
-    char chunk[CHUNK_SIZE];
-    long read_result;
-
-    while (1) {
-        read_result = read(client_fd, chunk, CHUNK_SIZE);
+    while (read_result == -2 || read_result == CHUNK_SIZE) {
+        read_result = read(client_fd, buffer + buffer_size, CHUNK_SIZE);
 
         if (read_result == -1) {
             // TODO handle error
             return NULL;
         }
 
-        if (buffer_size + read_result >= buffer_capacity) {
-            char *new_buffer = realloc(buffer, buffer_capacity + CHUNK_SIZE);
+        if (buffer_size + CHUNK_SIZE + 1 >= buffer_capacity) {
+            size_t new_capacity = buffer_capacity + CHUNK_SIZE + 1;
+            char *new_buffer = realloc(buffer, new_capacity);
+
             if (new_buffer == NULL) {
                 return NULL;
             }
+
             buffer = new_buffer;
-            buffer_capacity = buffer_capacity + CHUNK_SIZE;
+            buffer_capacity = new_capacity;
         }
 
-        memcpy(buffer + buffer_size, chunk, read_result);
         buffer_size += read_result;
-
-        if (read_result == 0 || read_result < CHUNK_SIZE) {
-            // ADD null terminator
-            if (buffer_size == buffer_capacity) {
-
-                char *new_buffer = realloc(buffer, buffer_capacity + 1);
-                if (new_buffer == NULL) {
-                    return NULL;
-                }
-
-                buffer = new_buffer;
-                buffer_capacity++;
-            }
-
-            buffer[buffer_size] = '\0';
-            buffer_size++;
-            break;
-        }
     }
+
+    buffer[buffer_size] = '\0';
+
+    buffer_size++;
 
     // 0 is a simple request - 1 is not
     int simple_request_candidate = 1;
@@ -758,7 +745,7 @@ int main(int argc, char **argv) {
         http_task_t task = {.handle = &handle_http_request, .arg1 = client_fd, .arg2 = public_path};
 
         // TODO we should check if tasks has enought space to store in queue
-        enqueue_http_task(&tasks, &tasks_count, task);
+        enqueue_http_task(&tasks, &tasks_count, &task);
     }
 
     for (int i = 0; i < MAX_THREAD_COUNT; i++) {

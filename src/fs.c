@@ -15,46 +15,58 @@ file_info_t *read_file(FILE *file) {
         return NULL;
     }
 
-    char file_chunk[1024];
-    long file_buffer_size = 0;
-    long file_buffer_capacity = 1024;
-    size_t read_count = -1;
+    const int CHUNK_SIZE = 1024;
+    size_t size = 0;
+    size_t capacity = CHUNK_SIZE;
+    size_t read_size = -1;
 
-    char *file_buffer = malloc(1024);
+    char *buffer = malloc(CHUNK_SIZE);
 
-    if (file_buffer == NULL) {
+    size_t new_capacity;
+    char *tmp_buffer;
+
+    if (buffer == NULL) {
         return NULL;
     }
 
-    while ((read_count = fread(file_chunk, 1, 1, file)) != 0) {
-        if (file_buffer_size + 1 > file_buffer_capacity) {
-            size_t new_capacity = file_buffer_capacity * 2 + 1;
-            char *new_file_buffer = realloc(file_buffer, new_capacity);
+    while ((read_size = fread(buffer + size, 1, CHUNK_SIZE, file)) != 0) {
+        if (size + CHUNK_SIZE >= capacity) {
+            new_capacity = capacity * 2;
+            printf("1. size %li\n", new_capacity);
+            tmp_buffer = realloc(buffer, new_capacity);
 
-            if (new_file_buffer == NULL) {
-                free(file_buffer);
+            if (tmp_buffer == NULL) {
+                free(buffer);
                 return NULL;
             }
 
-            file_buffer = new_file_buffer;
-            file_buffer_capacity = new_capacity;
+            buffer = tmp_buffer;
+            capacity = new_capacity;
         }
 
-        memmove(file_buffer + file_buffer_size, file_chunk, 1);
-        file_buffer_size += 1;
+        size += read_size;
     }
 
-    // file_buffer[file_buffer_size] = '\0';
+    // Realloc to remove unused memory
+    tmp_buffer = realloc(buffer, size + 1);
+
+    if (tmp_buffer == NULL) {
+        free(buffer);
+        return NULL;
+    }
+
+    buffer = tmp_buffer;
+    buffer[size] = '\0';
 
     file_info_t *info = malloc(sizeof(file_info_t));
 
     if (info == NULL) {
-        free(file_buffer);
+        free(buffer);
         return NULL;
     }
 
-    info->data = file_buffer;
-    info->size = file_buffer_size;
+    info->data = buffer;
+    info->size = size;
 
     return info;
 }

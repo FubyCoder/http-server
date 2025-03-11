@@ -16,7 +16,7 @@ typedef struct HttpStartThreadArgs {
     size_t *tasks_queue_count;
 } http_thread_args_t;
 
-void *enqueue_http_task(http_task_t **tasks_queue, size_t *tasks_queue_count, http_task_t task);
+void enqueue_http_task(http_task_t **tasks_queue, size_t *tasks_queue_count, http_task_t *task);
 
 void *start_http_task(http_thread_args_t *args);
 

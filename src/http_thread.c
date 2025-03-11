@@ -9,9 +9,9 @@
 pthread_mutex_t task_queue_mutex;
 pthread_cond_t task_queue_cond;
 
-void *enqueue_http_task(http_task_t **tasks_queue, size_t *tasks_queue_count, http_task_t task) {
+void enqueue_http_task(http_task_t **tasks_queue, size_t *tasks_queue_count, http_task_t *task) {
     pthread_mutex_lock(&task_queue_mutex);
-    (*tasks_queue)[(*tasks_queue_count)] = task;
+    (*tasks_queue)[(*tasks_queue_count)] = *task;
     (*tasks_queue_count)++;
     pthread_mutex_unlock(&task_queue_mutex);
     pthread_cond_signal(&task_queue_cond);
@@ -22,6 +22,7 @@ void *start_http_task(http_thread_args_t *args) {
     http_task_t **tasks_queue = args->tasks_queue;
 
     http_task_t task;
+
     while (1) {
         pthread_mutex_lock(&task_queue_mutex);
 
